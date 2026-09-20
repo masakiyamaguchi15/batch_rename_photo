@@ -16,3 +16,11 @@ rename_history.json
 rename_preview.csv
 photo_cache.json
 rollback_rename.py
+
+# Secrets & Environment
+.env
+*.env.local
+
+# Temp
+pyrefly.toml
+

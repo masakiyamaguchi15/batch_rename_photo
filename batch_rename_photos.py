@@ -33,6 +33,30 @@ geo_cache = {}
 vlm_pipeline = None
 yolo_model = None
 
+# .env ファイルが存在すれば自動ロード
+def _load_dotenv():
+    env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_file):
+        try:
+            with open(env_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if k not in os.environ:
+                            os.environ[k] = v
+        except Exception:
+            pass
+
+_load_dotenv()
+
+# Cloudflare Workers AI 設定 (環境変数 / .env から取得)
+DEFAULT_CF_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+DEFAULT_CF_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+DEFAULT_CF_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct"
+
 COCO_JA_MAP = {
     'person': '人物', 'bicycle': '自転車', 'car': '自動車', 'motorcycle': 'バイク',
     'airplane': '飛行機', 'bus': 'バス', 'train': '電車', 'truck': 'トラック',
@@ -59,7 +83,12 @@ COCO_JA_MAP = {
 def sanitize_filename_part(text):
     if not text:
         return "写真"
-    cleaned = re.sub(r'[\\/*?:"<>|\[\]\(\)\s　、。,\.\-\_]+', '', text)
+    first_line = text.strip().split('\n')[0].split('。')[0]
+    # 「この写真の主要な被写体は」「主要な被写体:」「答え:」などの前置き・オウム返しを除去
+    first_line = re.sub(r'^(この写真の主要な被写体|この写真の被写体|この写真|主要な被写体|主要な情景|被写体|情景|写真の内容|回答|答え|画像の内容|判定)[:：\sはが]+', '', first_line)
+    first_line = re.sub(r'^[0-9]+[\.\)\s、]+', '', first_line)
+    first_line = re.sub(r'(です|である|の写真)$', '', first_line)
+    cleaned = re.sub(r'[\\/*?:"<>|\[\]\(\)\s　、。,\.\-\_]+', '', first_line)
     cleaned = cleaned[:12]
     return cleaned if cleaned else "写真"
 
@@ -199,6 +228,83 @@ def recognize_content_lmstudio(file_path, model="default", lmstudio_url="http://
         return recognize_content_yolo(file_path)
     except Exception as e:
         print(f"LM Studio 画像処理エラー ({os.path.basename(file_path)}): {e}", flush=True)
+        return recognize_content_yolo(file_path)
+
+def check_cloudflare_status(account_id, api_token, model="@cf/meta/llama-3.2-11b-vision-instruct"):
+    """Cloudflare Workers AI の導通状態を確認し、利用規約同意（agree）を行う"""
+    try:
+        url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
+        headers = {
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json"
+        }
+        resp = requests.post(url, headers=headers, json={"prompt": "agree"}, timeout=15)
+        if resp.status_code == 200:
+            return True
+        if resp.status_code == 403 and "agree" in resp.text.lower():
+            return True
+        return False
+    except Exception:
+        return False
+
+def recognize_content_cloudflare(file_path, account_id, api_token, model="@cf/meta/llama-3.2-11b-vision-instruct", timeout=60):
+    """Cloudflare Workers AI (Llama 3.2 11B Vision) で日本語表現を取得"""
+    try:
+        with Image.open(file_path) as im:
+            im_rgb = im.convert("RGB")
+            im_rgb.thumbnail((1024, 1024))
+            buf = io.BytesIO()
+            im_rgb.save(buf, format="JPEG", quality=85)
+            img_bytes = buf.getvalue()
+            b64_image = base64.b64encode(img_bytes).decode("utf-8")
+
+        prompt = (
+            "この写真の主要な被写体または情景を、ファイル名に使用できる簡潔な日本語の名詞"
+            "（1〜2単語程度、記号なし、2〜8文字、例: ガジュマル, ジンベエザメ, ハイビスカス, 初日の出, ダイビング, BBQ, 集合写真, 料理 など）"
+            "で1つだけ出力してください。説明文や英語は不要です。"
+        )
+
+        url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
+        headers = {
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "prompt": prompt,
+            "image": b64_image,
+            "max_tokens": 30
+        }
+
+        for attempt in range(3):
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+                if resp.status_code == 200:
+                    res_data = resp.json()
+                    raw_text = res_data.get("result", {}).get("response", "").strip()
+                    raw_text = raw_text.split('\n')[0].split('。')[0]
+                    time.sleep(0.3)  # レートリミット防止の微小ウェイト
+                    return sanitize_filename_part(raw_text)
+                elif resp.status_code == 429:
+                    wait_sec = 2 * (attempt + 1)
+                    print(f"    [Cloudflare レート制限] 429 Too Many Requests。{wait_sec}秒待機後に再試行...", flush=True)
+                    time.sleep(wait_sec)
+                    continue
+                else:
+                    print(f"Cloudflare Workers AI エラー (HTTP {resp.status_code}): {resp.text}", flush=True)
+            except requests.exceptions.Timeout:
+                if attempt < 2:
+                    print(f"    [再試行] Cloudflare 応答タイムアウト（{timeout}秒）。再試行中...", flush=True)
+                    time.sleep(2)
+                    continue
+                else:
+                    print(f"    [タイムアウト] Cloudflare 応答が制限時間内に返りませんでした。", flush=True)
+            except Exception as e:
+                print(f"Cloudflare 通信エラー ({os.path.basename(file_path)}): {e}", flush=True)
+                break
+
+        return recognize_content_yolo(file_path)
+    except Exception as e:
+        print(f"Cloudflare 画像処理エラー ({os.path.basename(file_path)}): {e}", flush=True)
         return recognize_content_yolo(file_path)
 
 def load_yolo_model():
@@ -452,6 +558,10 @@ def main():
     parser.add_argument("--openvino-url", help="OpenVINO Server URL (e.g. http://192.168.40.116:8000)")
     parser.add_argument("--lmstudio-url", help="LM Studio Server URL (e.g. http://192.168.40.116:1234)")
     parser.add_argument("--ollama-url", default=default_ollama_host, help=f"Ollama Server URL (default: {default_ollama_host})")
+    parser.add_argument("--cloudflare", action="store_true", help="Use Cloudflare Workers AI")
+    parser.add_argument("--cf-account-id", default=DEFAULT_CF_ACCOUNT_ID, help="Cloudflare Account ID (from .env or CLOUDFLARE_ACCOUNT_ID)")
+    parser.add_argument("--cf-token", default=DEFAULT_CF_API_TOKEN, help="Cloudflare API Token (from .env or CLOUDFLARE_API_TOKEN)")
+    parser.add_argument("--cf-model", default=DEFAULT_CF_MODEL, help=f"Cloudflare AI Vision Model (default: {DEFAULT_CF_MODEL})")
     parser.add_argument("--timeout", type=int, default=180, help="API timeout in seconds (default: 180)")
     args = parser.parse_args()
 
@@ -470,12 +580,24 @@ def main():
     csv_file = os.path.join(target_root, "rename_preview.csv")
     cache_file = os.path.join(target_root, "photo_cache.json")
 
-    # バックエンド判定 (OpenVINO または LM Studio または Ollama または YOLO)
+    # バックエンド判定 (Cloudflare または OpenVINO または LM Studio または Ollama または YOLO)
     backend = "ollama"
     server_url = ""
     is_server_active = False
 
-    if args.openvino_url or (args.ollama_url and ":8000" in args.ollama_url):
+    if args.cloudflare or (args.model and "@cf/" in args.model):
+        backend = "cloudflare"
+        server_url = f"https://api.cloudflare.com/.../ai/run/{args.cf_model}"
+        print(f"[Cloudflare] Workers AI 接続を確認中 (モデル: {args.cf_model})...", flush=True)
+        is_server_active = check_cloudflare_status(args.cf_account_id, args.cf_token, args.cf_model)
+        if is_server_active:
+            model_label = f"Cloudflare ({os.path.basename(args.cf_model)})"
+            print(f"[Cloudflare] 接続確認完了！高精度クラウドGPU推論が可能です。\n", flush=True)
+        else:
+            print(f"[WARNING] Cloudflare Workers AI への接続に失敗しました。")
+            print("          トークンやAccount IDを確認してください。ローカル YOLO モデルへフォールバックします。")
+            model_label = "Cloudflare (未接続)"
+    elif args.openvino_url or (args.ollama_url and ":8000" in args.ollama_url):
         backend = "openvino"
         server_url = args.openvino_url if args.openvino_url else args.ollama_url
         if not server_url.startswith("http"):
@@ -590,24 +712,43 @@ def main():
     print(f"[1/2] EXIF・撮影日時・GPS位置情報の解析を開始します（全 {total_count} 件）...", flush=True)
     t_exif_start = time.time()
     exif_done = 0
+    cached_exif_count = 0
 
     for d, flist in dir_files.items():
         dir_records = []
         gps_locations_in_dir = []
         
-        # 1st Pass: EXIF / GPS
+        # 1st Pass: EXIF / GPS (キャッシュがあればクラウド・ディスクアクセスをスキップ)
         for fpath in flist:
             exif_done += 1
             if exif_done % 500 == 0 or exif_done == total_count:
                 print(f"  -> EXIF解析進捗: [{exif_done}/{total_count}]", flush=True)
 
             rel = os.path.relpath(fpath, target_root)
-            date_str, time_sort, lat, lon = extract_exif_info(fpath)
-            loc_str = ""
-            if lat is not None and lon is not None:
-                loc_str = get_location_name(lat, lon)
-                if loc_str:
-                    gps_locations_in_dir.append(loc_str)
+            cached_entry = cache.get(fpath) or cache.get(os.path.normpath(fpath))
+
+            if cached_entry and cached_entry.get("date"):
+                # キャッシュから高速ロード (Google ドライブ等の通信待機ゼロ)
+                date_str = cached_entry.get("date")
+                loc_str = cached_entry.get("location", "")
+                time_sort = cached_entry.get("time_sort", 0)
+                lat = cached_entry.get("lat")
+                lon = cached_entry.get("lon")
+                if not time_sort and date_str:
+                    try:
+                        time_sort = int(date_str + "000000")
+                    except Exception:
+                        time_sort = 0
+                cached_exif_count += 1
+            else:
+                date_str, time_sort, lat, lon = extract_exif_info(fpath)
+                loc_str = ""
+                if lat is not None and lon is not None:
+                    loc_str = get_location_name(lat, lon)
+
+            if loc_str:
+                gps_locations_in_dir.append(loc_str)
+
             dir_records.append({
                 "path": fpath,
                 "rel": rel,
@@ -624,7 +765,8 @@ def main():
             default_loc = Counter(gps_locations_in_dir).most_common(1)[0][0]
         folder_data[d] = (dir_records, default_loc)
 
-    print(f"  -> EXIF解析完了 (所要時間: {round(time.time() - t_exif_start, 1)} 秒)\n", flush=True)
+    t_exif_elapsed = round(time.time() - t_exif_start, 1)
+    print(f"  -> EXIF解析完了 (所要時間: {t_exif_elapsed} 秒, キャッシュ即時ロード: {cached_exif_count}/{total_count} 件)\n", flush=True)
     print(f"[2/2] AI 画像認識およびリネーム名判定を開始します...", flush=True)
 
     for d, (dir_records, default_loc) in folder_data.items():
@@ -641,7 +783,9 @@ def main():
                 content = cached_entry["content"]
             else:
                 print(f"[{processed_count}/{total_count}] [{model_label}] AI解析中: {os.path.basename(fpath)} ...", flush=True)
-                if backend == "lmstudio" and is_server_active:
+                if backend == "cloudflare" and is_server_active:
+                    content = recognize_content_cloudflare(fpath, account_id=args.cf_account_id, api_token=args.cf_token, model=args.cf_model, timeout=args.timeout)
+                elif backend == "lmstudio" and is_server_active:
                     content = recognize_content_lmstudio(fpath, model=args.model, lmstudio_url=server_url, timeout=args.timeout)
                 elif backend in ["ollama", "openvino"] and is_server_active:
                     content = recognize_content_vlm(fpath, model=args.model, ollama_url=server_url, timeout=args.timeout)
@@ -652,7 +796,10 @@ def main():
                 cache[fpath] = {
                     "date": item["date"],
                     "location": item["location"],
-                    "content": content
+                    "content": content,
+                    "time_sort": item.get("time_sort", 0),
+                    "lat": item.get("lat"),
+                    "lon": item.get("lon")
                 }
                 with open(cache_file, "w", encoding="utf-8") as cf:
                     json.dump(cache, cf, ensure_ascii=False, indent=2)
