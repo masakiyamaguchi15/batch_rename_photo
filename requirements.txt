@@ -4,3 +4,5 @@ pillow
 pillow-heif
 reverse_geocoder
 geopy
+openvino
+ultralytics

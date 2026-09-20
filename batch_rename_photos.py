@@ -441,6 +441,7 @@ def main():
     parser.add_argument("--execute", action="store_true", help="Perform actual rename")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of files for testing")
     parser.add_argument("--model", default="default", help="AI Model to use (default: auto-detected or llava:13b)")
+    parser.add_argument("--openvino-url", help="OpenVINO Server URL (e.g. http://192.168.40.116:8000)")
     parser.add_argument("--lmstudio-url", help="LM Studio Server URL (e.g. http://192.168.40.116:1234)")
     parser.add_argument("--ollama-url", default=default_ollama_host, help=f"Ollama Server URL (default: {default_ollama_host})")
     parser.add_argument("--timeout", type=int, default=180, help="API timeout in seconds (default: 180)")
@@ -461,12 +462,33 @@ def main():
     csv_file = os.path.join(target_root, "rename_preview.csv")
     cache_file = os.path.join(target_root, "photo_cache.json")
 
-    # バックエンド判定 (LM Studio または Ollama または YOLO)
+    # バックエンド判定 (OpenVINO または LM Studio または Ollama または YOLO)
     backend = "ollama"
     server_url = ""
     is_server_active = False
 
-    if args.lmstudio_url or (args.ollama_url and ":1234" in args.ollama_url):
+    if args.openvino_url or (args.ollama_url and ":8000" in args.ollama_url):
+        backend = "openvino"
+        server_url = args.openvino_url if args.openvino_url else args.ollama_url
+        if not server_url.startswith("http"):
+            server_url = f"http://{server_url}"
+        try:
+            chk_url = server_url.replace("0.0.0.0", "127.0.0.1").rstrip('/')
+            resp = requests.get(f"{chk_url}/health", timeout=5)
+            is_server_active = (resp.status_code == 200)
+            if is_server_active:
+                info = resp.json()
+                model_label = f"OpenVINO ({info.get('device', 'GPU')})"
+            else:
+                model_label = "OpenVINO (GPU)"
+        except Exception:
+            is_server_active = False
+            model_label = "OpenVINO (GPU)"
+
+        if not is_server_active:
+            print(f"[WARNING] OpenVINO サーバー ({server_url}) に接続できませんでした。")
+            print("          サーバーが未起動の場合はローカル YOLO モデルへフォールバックします。")
+    elif args.lmstudio_url or (args.ollama_url and ":1234" in args.ollama_url):
         backend = "lmstudio"
         server_url = args.lmstudio_url if args.lmstudio_url else args.ollama_url
         if not server_url.startswith("http"):
@@ -598,7 +620,7 @@ def main():
                 print(f"[{processed_count}/{total_count}] [{model_label}] AI解析中: {os.path.basename(fpath)} ...", flush=True)
                 if backend == "lmstudio" and is_server_active:
                     content = recognize_content_lmstudio(fpath, model=args.model, lmstudio_url=server_url, timeout=args.timeout)
-                elif backend == "ollama" and is_server_active:
+                elif backend in ["ollama", "openvino"] and is_server_active:
                     content = recognize_content_vlm(fpath, model=args.model, ollama_url=server_url, timeout=args.timeout)
                 else:
                     content = recognize_content_yolo(fpath)
