@@ -1,11 +1,13 @@
 import os
 import sys
+import re
 import json
 import base64
 import io
 import time
 import argparse
 import traceback
+import subprocess
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import Counter
 from PIL import Image
@@ -37,7 +39,100 @@ COCO_JA_MAP = {
     'teddy bear': 'ぬいぐるみ', 'hair drier': 'ドライヤー', 'toothbrush': '歯ブラシ'
 }
 
+def sanitize_vlm_output(text):
+    if not text:
+        return "写真"
+    first_line = text.strip().split('\n')[0].split('。')[0]
+    first_line = re.sub(r'^(被写体|情景|写真の内容|回答|答え|画像の内容|判定|主要な被写体)[:：\s]+', '', first_line)
+    first_line = re.sub(r'^[0-9]+[\.\)\s、]+', '', first_line)
+    first_line = re.sub(r'[\\/*?:"<>|\[\]\(\)\s　、。,\.\-\_]+', '', first_line)
+    first_line = first_line[:12]
+    return first_line if first_line else "写真"
+
+class OpenVINOVLMEngine:
+    """
+    OpenVINO GenAI Vision Language Model (VLM) 推論エンジン
+    Intel Arc GPU (140V) に約 4〜5GB の INT4 モデルをフルオフロードして
+    リッチな日本語認識（富士山, ジンベエザメ, ハイビスカス, BBQ, 披露宴など）を実行
+    """
+    def __init__(self, model_id="OpenVINO/Qwen2.5-VL-7B-Instruct-int4-ov", device="GPU"):
+        try:
+            import openvino_genai as ov_genai
+            from huggingface_hub import snapshot_download
+        except ImportError:
+            print("[OpenVINO VLM] 必要なパッケージ (openvino-genai, huggingface_hub) が見つかりません。")
+            print("                自動インストールを実行します...", flush=True)
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "openvino-genai", "huggingface_hub"])
+            import openvino_genai as ov_genai
+            from huggingface_hub import snapshot_download
+
+        import openvino as ov
+        core = ov.Core()
+        available = core.available_devices
+        print(f"[OpenVINO VLM] 検出されたデバイス: {available}", flush=True)
+
+        if device.upper() == "GPU" and not any("GPU" in d for d in available):
+            print("[OpenVINO VLM] GPUが検出されなかったため、CPUを使用します。", flush=True)
+            self.device = "CPU"
+        else:
+            self.device = device.upper()
+            print(f"[OpenVINO VLM] 選択されたデバイス: {self.device} (Intel Arc GPU)", flush=True)
+
+        self.model_id = model_id
+        self.model_name = os.path.basename(model_id)
+
+        print(f"\n[OpenVINO VLM] モデル '{model_id}' のダウンロード/キャッシュを確認中...", flush=True)
+        model_path = snapshot_download(repo_id=model_id)
+        print(f"[OpenVINO VLM] モデル格納先: {model_path}", flush=True)
+
+        print(f"[OpenVINO VLM] モデルを {self.device} (GPU VRAM / メモリ) にロード中...", flush=True)
+        print(f"             ※ 初回はコンパイルに数十秒〜1分程度かかります...", flush=True)
+        t0 = time.time()
+        self.pipe = ov_genai.VLMPipeline(model_path, self.device)
+        t_load = round(time.time() - t0, 1)
+        print(f"[OpenVINO VLM] モデルロード完了！ ({t_load} 秒)")
+        print(f"[OpenVINO VLM] Intel Arc GPU にオフロードされました。高精度な日本語認識が可能です。\n", flush=True)
+
+    def predict_base64(self, b64_str):
+        import openvino as ov
+        import numpy as np
+
+        img_bytes = base64.b64decode(b64_str)
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        # 推論高速化のため、最大解像度を 768px にリサイズ
+        img.thumbnail((768, 768))
+
+        img_data = np.array(img)[None]
+        img_tensor = ov.Tensor(img_data)
+
+        prompt = (
+            "この写真の主要な被写体または情景を、写真ファイル名に使える簡潔な日本語の名詞"
+            "（1〜2単語程度、記号なし、2〜8文字、例: ジンベエザメ, ハイビスカス, 初日の出, BBQ, 集合写真, ラーメン, カフェ, 神社）"
+            "で1つだけ出力してください。説明文や英語は不要です。"
+        )
+
+        try:
+            try:
+                res = self.pipe.generate(prompt, images=[img_tensor], max_new_tokens=25)
+            except TypeError:
+                res = self.pipe.generate(prompt, image=img_tensor, max_new_tokens=25)
+
+            if hasattr(res, "texts") and res.texts:
+                raw_text = res.texts[0]
+            elif hasattr(res, "text"):
+                raw_text = res.text
+            else:
+                raw_text = str(res)
+
+            return sanitize_vlm_output(raw_text)
+        except Exception as e:
+            print(f"[OpenVINO VLM] 推論エラー: {e}", flush=True)
+            return "写真"
+
 class OpenVINOYOLOEngine:
+    """
+    OpenVINO YOLOv11 超高速推論エンジン (1枚あたり 0.02〜0.04秒)
+    """
     def __init__(self, device="GPU"):
         from ultralytics import YOLO
         import openvino as ov
@@ -45,25 +140,26 @@ class OpenVINOYOLOEngine:
         self.device = device
         core = ov.Core()
         available = core.available_devices
-        print(f"[OpenVINO] 検出されたデバイス: {available}", flush=True)
+        print(f"[OpenVINO YOLO] 検出されたデバイス: {available}", flush=True)
 
         if device.upper() == "GPU" and not any("GPU" in d for d in available):
-            print("[OpenVINO] GPUが検出されなかったため、CPUを使用します。", flush=True)
+            print("[OpenVINO YOLO] GPUが検出されなかったため、CPUを使用します。", flush=True)
             self.device = "CPU"
         else:
             self.device = device.upper()
-            print(f"[OpenVINO] 選択されたデバイス: {self.device}", flush=True)
+            print(f"[OpenVINO YOLO] 選択されたデバイス: {self.device}", flush=True)
 
+        self.model_name = "YOLOv11n (40ms 高速モード)"
         model_dir = os.path.join(os.path.expanduser("~"), ".openvino_photo_rename_model")
         os.makedirs(model_dir, exist_ok=True)
         ov_model_path = os.path.join(model_dir, "yolo11n_openvino_model")
 
         if not os.path.exists(ov_model_path):
-            print("[OpenVINO] YOLOv11n を OpenVINO IR 形式に最適化エクスポート中（初回のみ）...", flush=True)
+            print("[OpenVINO YOLO] YOLOv11n を OpenVINO IR 形式に最適化エクスポート中（初回のみ）...", flush=True)
             pt = YOLO("yolo11n.pt")
             ov_model_path = pt.export(format="openvino", dynamic=False)
 
-        print(f"[OpenVINO] モデル読み込み中: {ov_model_path} (intel:{self.device})", flush=True)
+        print(f"[OpenVINO YOLO] モデル読み込み中: {ov_model_path} (intel:{self.device})", flush=True)
         self.model = YOLO(ov_model_path, task="detect")
         self.intel_device_str = f"intel:{self.device}"
         
@@ -74,7 +170,7 @@ class OpenVINOYOLOEngine:
         except Exception:
             self.model(dummy_img, verbose=False)
 
-        print(f"[OpenVINO] モデル準備完了！デバイス '{self.device}' で超高速推論（0.01〜0.05秒/枚）が利用可能です。", flush=True)
+        print(f"[OpenVINO YOLO] モデル準備完了！デバイス '{self.device}' で超高速推論（0.01〜0.05秒/枚）が利用可能です。", flush=True)
 
     def predict_base64(self, b64_str):
         img_bytes = base64.b64decode(b64_str)
@@ -124,7 +220,8 @@ class OpenVINORequestHandler(BaseHTTPRequestHandler):
                 "status": "ok",
                 "engine": "OpenVINO",
                 "device": ov_engine.device if ov_engine else "unknown",
-                "models": [{"name": "openvino-yolo11", "model": "openvino-yolo11"}]
+                "model_name": ov_engine.model_name if hasattr(ov_engine, "model_name") else "unknown",
+                "models": [{"name": getattr(ov_engine, "model_name", "openvino-model"), "model": getattr(ov_engine, "model_name", "openvino-model")}]
             }
             self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
         else:
@@ -173,7 +270,7 @@ class OpenVINORequestHandler(BaseHTTPRequestHandler):
             resp_data = {
                 "response": label,
                 "choices": [{"message": {"content": label}}],
-                "model": "openvino-yolo11"
+                "model": getattr(ov_engine, "model_name", "openvino")
             }
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -184,6 +281,7 @@ class OpenVINORequestHandler(BaseHTTPRequestHandler):
             traceback.print_exc()
             self.send_response(500)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             err_data = {"error": str(e), "response": "写真"}
             self.wfile.write(json.dumps(err_data).encode('utf-8'))
@@ -199,19 +297,30 @@ class OpenVINORequestHandler(BaseHTTPRequestHandler):
         pass
 
 def main():
-    parser = argparse.ArgumentParser(description="OpenVINO Dedicated LAN AI Server")
+    parser = argparse.ArgumentParser(description="OpenVINO Dedicated LAN AI Server (VLM & YOLO)")
     parser.add_argument("--host", default="0.0.0.0", help="Listen host (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8000, help="Listen port (default: 8000)")
+    parser.add_argument("--engine", default="vlm", choices=["vlm", "yolo"], help="Engine: vlm (Vision LLM) or yolo (Fast Detection)")
+    parser.add_argument("--vlm-model", default="OpenVINO/Qwen2.5-VL-7B-Instruct-int4-ov", help="Hugging Face OpenVINO VLM model ID")
     parser.add_argument("--device", default="GPU", help="OpenVINO Device: GPU, NPU, CPU (default: GPU)")
     args = parser.parse_args()
 
     global ov_engine
-    ov_engine = OpenVINOYOLOEngine(device=args.device)
+    if args.engine == "vlm":
+        try:
+            ov_engine = OpenVINOVLMEngine(model_id=args.vlm_model, device=args.device)
+        except Exception as e:
+            print(f"\n[WARNING] VLM エンジンの初期化に失敗しました: {e}")
+            print("          超高速 YOLO エンジンに自動フォールバックします...\n", flush=True)
+            ov_engine = OpenVINOYOLOEngine(device=args.device)
+    else:
+        ov_engine = OpenVINOYOLOEngine(device=args.device)
 
     server = HTTPServer((args.host, args.port), OpenVINORequestHandler)
     print(f"\n=======================================================")
     print(f"=== OpenVINO Dedicated LAN AI Server ===")
     print(f"待機アドレス : http://{args.host}:{args.port}")
+    print(f"エンジン種別 : {args.engine.upper()} ({ov_engine.model_name})")
     print(f"稼働デバイス : {ov_engine.device} (Intel Arc GPU / NPU / CPU)")
     print(f"※ このウィンドウを開いたままにしておいてください")
     print(f"=======================================================\n", flush=True)

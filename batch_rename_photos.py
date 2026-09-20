@@ -486,7 +486,8 @@ def main():
             is_server_active = (resp.status_code == 200)
             if is_server_active:
                 info = resp.json()
-                model_label = f"OpenVINO ({info.get('device', 'GPU')})"
+                engine_name = info.get('model_name', info.get('device', 'GPU'))
+                model_label = f"OpenVINO ({engine_name})"
             else:
                 model_label = "OpenVINO (GPU)"
         except Exception:
