@@ -125,6 +125,79 @@ def recognize_content_vlm(file_path, model="llama3.2-vision", ollama_url="http:/
         print(f"VLM 推論エラー ({os.path.basename(file_path)}): {e}", flush=True)
         return recognize_content_yolo(file_path)
 
+def check_lmstudio_status(lmstudio_url="http://localhost:1234"):
+    """LM Studio (OpenAI互換) サーバーの導通状態を確認"""
+    try:
+        target_url = lmstudio_url.replace("0.0.0.0", "127.0.0.1").rstrip('/')
+        resp = requests.get(f"{target_url}/v1/models", timeout=5)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+def recognize_content_lmstudio(file_path, model="default", lmstudio_url="http://localhost:1234", timeout=180):
+    """LM Studio (OpenAI 互換 Vision API) で日本語表現を取得"""
+    try:
+        target_url = lmstudio_url.replace("0.0.0.0", "127.0.0.1").rstrip('/')
+        with Image.open(file_path) as im:
+            im_rgb = im.convert("RGB")
+            im_rgb.thumbnail((1024, 1024))
+            buf = io.BytesIO()
+            im_rgb.save(buf, format="JPEG", quality=85)
+            img_bytes = buf.getvalue()
+            b64_image = base64.b64encode(img_bytes).decode("utf-8")
+
+        prompt = (
+            "この写真の主要な被写体または情景を、ファイル名に使用できる簡潔な日本語の名詞"
+            "（1〜2単語程度、記号なし、2〜8文字、例: ガジュマル, ジンベエザメ, ハイビスカス, 初日の出, ダイビング, BBQ, 集合写真, 料理 など）"
+            "で1つだけ出力してください。説明文や英語は不要です。"
+        )
+
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{b64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "temperature": 0.1,
+            "max_tokens": 30
+        }
+
+        for attempt in range(2):
+            try:
+                resp = requests.post(f"{target_url}/v1/chat/completions", json=payload, timeout=timeout)
+                if resp.status_code == 200:
+                    res_data = resp.json()
+                    raw_text = res_data["choices"][0]["message"]["content"].strip()
+                    raw_text = raw_text.split('\n')[0].split('。')[0]
+                    return sanitize_filename_part(raw_text)
+                else:
+                    print(f"LM Studio API エラー (HTTP {resp.status_code}): {resp.text}", flush=True)
+            except requests.exceptions.Timeout:
+                if attempt == 0:
+                    print(f"    [再試行] LM Studio 応答タイムアウト（{timeout}秒）。再試行中...", flush=True)
+                    time.sleep(2)
+                    continue
+                else:
+                    print(f"    [タイムアウト] LM Studio 応答が制限時間内に返りませんでした。", flush=True)
+            except Exception as e:
+                print(f"LM Studio 通信エラー ({os.path.basename(file_path)}): {e}", flush=True)
+                break
+
+        return recognize_content_yolo(file_path)
+    except Exception as e:
+        print(f"LM Studio 画像処理エラー ({os.path.basename(file_path)}): {e}", flush=True)
+        return recognize_content_yolo(file_path)
+
 def load_yolo_model():
     global yolo_model
     if yolo_model is not None:
@@ -362,14 +435,15 @@ def main():
     if ":11434" not in default_ollama_host and not default_ollama_host.endswith(":11434"):
         default_ollama_host = f"{default_ollama_host}:11434"
 
-    parser = argparse.ArgumentParser(description="Rename photos with EXIF date, location, and Ollama Vision AI Model.")
+    parser = argparse.ArgumentParser(description="Rename photos with EXIF date, location, and Vision AI Model (LM Studio / Ollama).")
     parser.add_argument("--year", help="Target year (e.g. 2009, 2025)")
     parser.add_argument("--root", help="Root directory (Overrides --year)")
     parser.add_argument("--execute", action="store_true", help="Perform actual rename")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of files for testing")
-    parser.add_argument("--model", default="llava:13b", help="AI Model to use: llava:13b, llava, llama3.2-vision, yolo (default: llava:13b)")
+    parser.add_argument("--model", default="default", help="AI Model to use (default: auto-detected or llava:13b)")
+    parser.add_argument("--lmstudio-url", help="LM Studio Server URL (e.g. http://192.168.40.116:1234)")
     parser.add_argument("--ollama-url", default=default_ollama_host, help=f"Ollama Server URL (default: {default_ollama_host})")
-    parser.add_argument("--timeout", type=int, default=180, help="Ollama API timeout in seconds (default: 180)")
+    parser.add_argument("--timeout", type=int, default=180, help="API timeout in seconds (default: 180)")
     args = parser.parse_args()
 
     if args.root:
@@ -387,30 +461,63 @@ def main():
     csv_file = os.path.join(target_root, "rename_preview.csv")
     cache_file = os.path.join(target_root, "photo_cache.json")
 
-    is_ollama_active = False
-    if args.model.lower() != "yolo":
-        target_check_url = args.ollama_url.replace("0.0.0.0", "127.0.0.1")
-        is_ollama_active = check_ollama_status(target_check_url)
-        if not is_ollama_active:
-            print(f"[WARNING] Ollama サーバー ({args.ollama_url}) に接続できませんでした。")
-            print("          Ollama が未起動の場合は YOLO モデルへフォールバックします。")
+    # バックエンド判定 (LM Studio または Ollama または YOLO)
+    backend = "ollama"
+    server_url = ""
+    is_server_active = False
 
-    model_label = f"Ollama ({args.model})" if args.model.lower() != "yolo" else "YOLOv11"
+    if args.lmstudio_url or (args.ollama_url and ":1234" in args.ollama_url):
+        backend = "lmstudio"
+        server_url = args.lmstudio_url if args.lmstudio_url else args.ollama_url
+        if not server_url.startswith("http"):
+            server_url = f"http://{server_url}"
+        is_server_active = check_lmstudio_status(server_url)
+        if not is_server_active:
+            print(f"[WARNING] LM Studio サーバー ({server_url}) に接続できませんでした。")
+            print("          LM Studio が未起動の場合は YOLO モデルへフォールバックします。")
+        else:
+            try:
+                target_chk = server_url.replace("0.0.0.0", "127.0.0.1").rstrip('/')
+                m_resp = requests.get(f"{target_chk}/v1/models", timeout=5).json()
+                loaded_models = [m.get("id") for m in m_resp.get("data", [])]
+                if loaded_models:
+                    if args.model in ["default", "llava:13b", "llava:34b"]:
+                        args.model = loaded_models[0]
+            except Exception:
+                pass
+        model_label = f"LM Studio ({args.model})"
+    elif args.model.lower() == "yolo":
+        backend = "yolo"
+        is_server_active = True
+        model_label = "YOLOv11"
+    else:
+        backend = "ollama"
+        if args.model == "default":
+            args.model = "llava:13b"
+        server_url = args.ollama_url
+        target_check_url = server_url.replace("0.0.0.0", "127.0.0.1")
+        is_server_active = check_ollama_status(target_check_url)
+        if not is_server_active:
+            print(f"[WARNING] Ollama サーバー ({server_url}) に接続できませんでした。")
+            print("          Ollama が未起動の場合は YOLO モデルへフォールバックします。")
+        model_label = f"Ollama ({args.model})"
 
     print(f"\n==========================================")
-    print(f"=== Photo Batch Renaming Tool (Ollama) ===")
+    print(f"=== Photo Batch Renaming Tool ===")
+    print(f"AI バックエンド  : {backend.upper()}")
     print(f"使用AIモデル     : {model_label}")
-    print(f"Ollama サーバー  : {args.ollama_url}")
+    if backend != "yolo":
+        print(f"AI サーバー URL  : {server_url}")
     print(f"対象ディレクトリ : {target_root}")
     print(f"動作モード       : {'【実行 (ファイル変更あり)】' if args.execute else '【プレビューのみ (DRY-RUN)】'}")
     if args.limit > 0:
         print(f"処理件数制限     : 上限 {args.limit} 件")
     print(f"==========================================\n")
 
-    if is_ollama_active and args.model.lower() != "yolo":
+    if backend == "ollama" and is_server_active:
         print(f"[Ollama] モデル '{args.model}' を初期化中（大容量モデルの初回起動は数十秒待機します）...", flush=True)
         try:
-            target_warmup_url = args.ollama_url.replace("0.0.0.0", "127.0.0.1").rstrip('/')
+            target_warmup_url = server_url.replace("0.0.0.0", "127.0.0.1").rstrip('/')
             requests.post(
                 f"{target_warmup_url}/api/generate",
                 json={"model": args.model, "prompt": "", "keep_alive": "15m"},
@@ -419,6 +526,8 @@ def main():
             print(f"[Ollama] モデル '{args.model}' の準備が完了しました。\n", flush=True)
         except Exception as e:
             print(f"[Ollama] 事前確認完了 (継続します)\n", flush=True)
+    elif backend == "lmstudio" and is_server_active:
+        print(f"[LM Studio] 接続確認完了。アクティブモデル: {args.model}\n", flush=True)
 
     cache = {}
     if os.path.exists(cache_file):
@@ -487,8 +596,10 @@ def main():
                 content = cached_entry["content"]
             else:
                 print(f"[{processed_count}/{total_count}] [{model_label}] AI解析中: {os.path.basename(fpath)} ...", flush=True)
-                if args.model.lower() != "yolo" and is_ollama_active:
-                    content = recognize_content_vlm(fpath, model=args.model, ollama_url=args.ollama_url, timeout=args.timeout)
+                if backend == "lmstudio" and is_server_active:
+                    content = recognize_content_lmstudio(fpath, model=args.model, lmstudio_url=server_url, timeout=args.timeout)
+                elif backend == "ollama" and is_server_active:
+                    content = recognize_content_vlm(fpath, model=args.model, ollama_url=server_url, timeout=args.timeout)
                 else:
                     content = recognize_content_yolo(fpath)
 
