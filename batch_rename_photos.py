@@ -344,7 +344,7 @@ def main():
     parser.add_argument("--root", help="Root directory (Overrides --year)")
     parser.add_argument("--execute", action="store_true", help="Perform actual rename")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of files for testing")
-    parser.add_argument("--model", default="llava", help="AI Model to use: llava, llama3.2-vision, qwen2.5-vl, yolo (default: llava)")
+    parser.add_argument("--model", default="llava:13b", help="AI Model to use: llava:13b, llava, llama3.2-vision, yolo (default: llava:13b)")
     parser.add_argument("--ollama-url", default=default_ollama_host, help=f"Ollama Server URL (default: {default_ollama_host})")
     args = parser.parse_args()
 
