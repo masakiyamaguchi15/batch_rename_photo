@@ -69,7 +69,7 @@ def check_ollama_status(ollama_url="http://localhost:11434"):
     except Exception:
         return False
 
-def recognize_content_vlm(file_path, model="llama3.2-vision", ollama_url="http://localhost:11434"):
+def recognize_content_vlm(file_path, model="llama3.2-vision", ollama_url="http://localhost:11434", timeout=180):
     """Ollama Vision API (llama3.2-vision / llava など) で日本語表現を取得"""
     try:
         target_url = ollama_url.replace("0.0.0.0", "127.0.0.1").rstrip('/')
@@ -98,15 +98,28 @@ def recognize_content_vlm(file_path, model="llama3.2-vision", ollama_url="http:/
             }
         }
 
-        resp = requests.post(f"{target_url}/api/generate", json=payload, timeout=60)
-        if resp.status_code == 200:
-            res_data = resp.json()
-            raw_text = res_data.get("response", "").strip()
-            raw_text = raw_text.split('\n')[0].split('。')[0]
-            return sanitize_filename_part(raw_text)
-        else:
-            print(f"Ollama API エラー (HTTP {resp.status_code}): {resp.text}", flush=True)
-            return recognize_content_yolo(file_path)
+        for attempt in range(2):
+            try:
+                resp = requests.post(f"{target_url}/api/generate", json=payload, timeout=timeout)
+                if resp.status_code == 200:
+                    res_data = resp.json()
+                    raw_text = res_data.get("response", "").strip()
+                    raw_text = raw_text.split('\n')[0].split('。')[0]
+                    return sanitize_filename_part(raw_text)
+                else:
+                    print(f"Ollama API エラー (HTTP {resp.status_code}): {resp.text}", flush=True)
+            except requests.exceptions.Timeout:
+                if attempt == 0:
+                    print(f"    [再試行] Ollama 応答タイムアウト（{timeout}秒）。モデル準備中の可能性があるため再試行します...", flush=True)
+                    time.sleep(2)
+                    continue
+                else:
+                    print(f"    [タイムアウト] Ollama 応答が制限時間内に返りませんでした。", flush=True)
+            except Exception as e:
+                print(f"VLM 通信エラー ({os.path.basename(file_path)}): {e}", flush=True)
+                break
+
+        return recognize_content_yolo(file_path)
 
     except Exception as e:
         print(f"VLM 推論エラー ({os.path.basename(file_path)}): {e}", flush=True)
@@ -117,21 +130,31 @@ def load_yolo_model():
     if yolo_model is not None:
         return yolo_model
 
-    from ultralytics import YOLO
-    model_dir = os.path.join(os.path.expanduser("~"), ".openvino_photo_rename_model")
-    os.makedirs(model_dir, exist_ok=True)
-    ov_export_path = os.path.join(model_dir, "yolo11n_openvino_model")
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        return None
 
-    if not os.path.exists(ov_export_path):
-        pt_model = YOLO("yolo11n.pt")
-        ov_export_path = pt_model.export(format="openvino")
+    try:
+        model_dir = os.path.join(os.path.expanduser("~"), ".openvino_photo_rename_model")
+        os.makedirs(model_dir, exist_ok=True)
+        ov_export_path = os.path.join(model_dir, "yolo11n_openvino_model")
 
-    yolo_model = YOLO(ov_export_path, task="detect")
-    return yolo_model
+        if not os.path.exists(ov_export_path):
+            pt_model = YOLO("yolo11n.pt")
+            ov_export_path = pt_model.export(format="openvino")
+
+        yolo_model = YOLO(ov_export_path, task="detect")
+        return yolo_model
+    except Exception as e:
+        print(f"YOLO モデル読み込みスキップ: {e}", flush=True)
+        return None
 
 def recognize_content_yolo(file_path):
-    model = load_yolo_model()
     try:
+        model = load_yolo_model()
+        if model is None:
+            return "写真"
         results = model(file_path, verbose=False, conf=0.35)
         if not results or len(results) == 0:
             return "写真"
@@ -346,6 +369,7 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="Limit number of files for testing")
     parser.add_argument("--model", default="llava:13b", help="AI Model to use: llava:13b, llava, llama3.2-vision, yolo (default: llava:13b)")
     parser.add_argument("--ollama-url", default=default_ollama_host, help=f"Ollama Server URL (default: {default_ollama_host})")
+    parser.add_argument("--timeout", type=int, default=180, help="Ollama API timeout in seconds (default: 180)")
     args = parser.parse_args()
 
     if args.root:
@@ -382,6 +406,19 @@ def main():
     if args.limit > 0:
         print(f"処理件数制限     : 上限 {args.limit} 件")
     print(f"==========================================\n")
+
+    if is_ollama_active and args.model.lower() != "yolo":
+        print(f"[Ollama] モデル '{args.model}' を初期化中（大容量モデルの初回起動は数十秒待機します）...", flush=True)
+        try:
+            target_warmup_url = args.ollama_url.replace("0.0.0.0", "127.0.0.1").rstrip('/')
+            requests.post(
+                f"{target_warmup_url}/api/generate",
+                json={"model": args.model, "prompt": "", "keep_alive": "15m"},
+                timeout=args.timeout
+            )
+            print(f"[Ollama] モデル '{args.model}' の準備が完了しました。\n", flush=True)
+        except Exception as e:
+            print(f"[Ollama] 事前確認完了 (継続します)\n", flush=True)
 
     cache = {}
     if os.path.exists(cache_file):
@@ -451,7 +488,7 @@ def main():
             else:
                 print(f"[{processed_count}/{total_count}] [{model_label}] AI解析中: {os.path.basename(fpath)} ...", flush=True)
                 if args.model.lower() != "yolo" and is_ollama_active:
-                    content = recognize_content_vlm(fpath, model=args.model, ollama_url=args.ollama_url)
+                    content = recognize_content_vlm(fpath, model=args.model, ollama_url=args.ollama_url, timeout=args.timeout)
                 else:
                     content = recognize_content_yolo(fpath)
 

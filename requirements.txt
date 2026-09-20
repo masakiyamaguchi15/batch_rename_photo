@@ -1,0 +1,6 @@
+numpy
+requests
+pillow
+pillow-heif
+reverse_geocoder
+geopy
