@@ -263,37 +263,40 @@ def recognize_content_yolo(file_path):
     except Exception:
         return "写真"
 
+PREF_EN_JA = {
+    'Hokkaido': '北海道', 'Aomori': '青森県', 'Iwate': '岩手県', 'Miyagi': '宮城県', 'Akita': '秋田県',
+    'Yamagata': '山形県', 'Fukushima': '福島県', 'Ibaraki': '茨城県', 'Tochigi': '栃木県', 'Gunma': '群馬県',
+    'Saitama': '埼玉県', 'Chiba': '千葉県', 'Tokyo': '東京都', 'Kanagawa': '神奈川県', 'Niigata': '新潟県',
+    'Toyama': '富山県', 'Ishikawa': '石川県', 'Fukui': '福井県', 'Yamanashi': '山梨県', 'Nagano': '長野県',
+    'Gifu': '岐阜県', 'Shizuoka': '静岡県', 'Aichi': '愛知県', 'Mie': '三重県', 'Shiga': '滋賀県',
+    'Kyoto': '京都府', 'Osaka': '大阪府', 'Hyogo': '兵庫県', 'Nara': '奈良県', 'Wakayama': '和歌山県',
+    'Tottori': '鳥取県', 'Shimane': '島根県', 'Okayama': '岡山県', 'Hiroshima': '広島県', 'Yamaguchi': '山口県',
+    'Tokushima': '徳島県', 'Kagawa': '香川県', 'Ehime': '愛媛県', 'Kochi': '高知県', 'Fukuoka': '福岡県',
+    'Saga': '佐賀県', 'Nagasaki': '長崎県', 'Kumamoto': '熊本県', 'Oita': '大分県', 'Miyazaki': '宮崎県',
+    'Kagoshima': '鹿児島県', 'Okinawa': '沖縄県'
+}
+
 def get_location_name(lat, lon):
     if lat is None or lon is None:
         return ""
-    cache_key = (round(lat, 3), round(lon, 3))
+    cache_key = f"{round(lat, 3)},{round(lon, 3)}"
     if cache_key in geo_cache:
         return geo_cache[cache_key]
     
-    try:
-        time.sleep(0.3)
-        location = geolocator.reverse((lat, lon), language='ja', timeout=5)
-        if location and 'address' in location.raw:
-            addr = location.raw['address']
-            province = addr.get('province', addr.get('state', ''))
-            city = addr.get('city', addr.get('town', addr.get('village', addr.get('suburb', ''))))
-            loc_str = f"{province}{city}".strip()
+    # 1. 超高速なオフライン逆ジオコーディング (0.1ミリ秒 / ネットワーク待機ゼロ)
+    if rg:
+        try:
+            res = rg.search([(lat, lon)], mode=1)[0]
+            pref = res.get('admin1', '').strip()
+            name = res.get('name', '').strip()
+            pref_ja = PREF_EN_JA.get(pref, pref)
+            loc_str = f"{pref_ja}{name}".strip()
             if loc_str:
                 geo_cache[cache_key] = loc_str
                 return loc_str
-    except Exception:
-        pass
-    
-    if rg:
-        try:
-            res = rg.search([(lat, lon)])[0]
-            pref = res.get('admin1', '')
-            name = res.get('name', '')
-            loc_str = f"{pref}{name}".strip()
-            geo_cache[cache_key] = loc_str
-            return loc_str
         except Exception:
-            return ""
+            pass
+
     return ""
 
 def convert_dms_to_deg(dms, ref):
@@ -582,12 +585,21 @@ def main():
     total_count = len(files)
     processed_count = 0
 
+    folder_data = {}
+    print(f"[1/2] EXIF・撮影日時・GPS位置情報の解析を開始します（全 {total_count} 件）...", flush=True)
+    t_exif_start = time.time()
+    exif_done = 0
+
     for d, flist in dir_files.items():
         dir_records = []
         gps_locations_in_dir = []
         
         # 1st Pass: EXIF / GPS
         for fpath in flist:
+            exif_done += 1
+            if exif_done % 500 == 0 or exif_done == total_count:
+                print(f"  -> EXIF解析進捗: [{exif_done}/{total_count}]", flush=True)
+
             rel = os.path.relpath(fpath, target_root)
             date_str, time_sort, lat, lon = extract_exif_info(fpath)
             loc_str = ""
@@ -609,7 +621,12 @@ def main():
         default_loc = ""
         if gps_locations_in_dir:
             default_loc = Counter(gps_locations_in_dir).most_common(1)[0][0]
+        folder_data[d] = (dir_records, default_loc)
 
+    print(f"  -> EXIF解析完了 (所要時間: {round(time.time() - t_exif_start, 1)} 秒)\n", flush=True)
+    print(f"[2/2] AI 画像認識およびリネーム名判定を開始します...", flush=True)
+
+    for d, (dir_records, default_loc) in folder_data.items():
         # 2nd Pass: AI 画像認識
         for item in dir_records:
             processed_count += 1
