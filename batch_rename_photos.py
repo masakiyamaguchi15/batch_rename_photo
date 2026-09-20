@@ -14,7 +14,10 @@ import requests
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS, IFD
 import pillow_heif
-import reverse_geocoder as rg
+try:
+    import reverse_geocoder as rg
+except Exception:
+    rg = None
 from geopy.geocoders import Nominatim
 
 sys.stdout.reconfigure(encoding='utf-8')
@@ -281,15 +284,17 @@ def get_location_name(lat, lon):
     except Exception:
         pass
     
-    try:
-        res = rg.search([(lat, lon)])[0]
-        pref = res.get('admin1', '')
-        name = res.get('name', '')
-        loc_str = f"{pref}{name}".strip()
-        geo_cache[cache_key] = loc_str
-        return loc_str
-    except Exception:
-        return ""
+    if rg:
+        try:
+            res = rg.search([(lat, lon)])[0]
+            pref = res.get('admin1', '')
+            name = res.get('name', '')
+            loc_str = f"{pref}{name}".strip()
+            geo_cache[cache_key] = loc_str
+            return loc_str
+        except Exception:
+            return ""
+    return ""
 
 def convert_dms_to_deg(dms, ref):
     if not dms or len(dms) < 3:
