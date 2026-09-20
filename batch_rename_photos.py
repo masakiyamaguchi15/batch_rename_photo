@@ -1,0 +1,570 @@
+import os
+import sys
+import re
+import json
+import time
+import io
+import argparse
+import base64
+from datetime import datetime
+from collections import defaultdict, Counter
+
+import numpy as np
+import requests
+from PIL import Image
+from PIL.ExifTags import TAGS, GPSTAGS, IFD
+import pillow_heif
+import reverse_geocoder as rg
+from geopy.geocoders import Nominatim
+
+sys.stdout.reconfigure(encoding='utf-8')
+pillow_heif.register_heif_opener()
+
+VALID_EXTENSIONS = {'.jpg', '.jpeg', '.heic', '.png'}
+BASE_PHOTO_DIR = r"G:\マイドライブ\5-PHOTO"
+
+geolocator = Nominatim(user_agent="photo_sorter_openvino_vlm_tool")
+geo_cache = {}
+
+# グローバルモデル保持
+vlm_pipeline = None
+yolo_model = None
+
+COCO_JA_MAP = {
+    'person': '人物', 'bicycle': '自転車', 'car': '自動車', 'motorcycle': 'バイク',
+    'airplane': '飛行機', 'bus': 'バス', 'train': '電車', 'truck': 'トラック',
+    'boat': '船', 'traffic light': '信号', 'fire hydrant': '消火栓', 'stop sign': '標識',
+    'bench': 'ベンチ', 'bird': '鳥', 'cat': '猫', 'dog': '犬', 'horse': '馬',
+    'sheep': '羊', 'cow': '牛', 'elephant': '象', 'bear': 'クマ', 'zebra': 'シマウマ',
+    'giraffe': 'キリン', 'backpack': 'リュック', 'umbrella': '傘', 'handbag': 'バッグ',
+    'tie': 'ネクタイ', 'suitcase': 'スーツケース', 'frisbee': 'フリスビー', 'skis': 'スキー',
+    'snowboard': 'スノーボード', 'sports ball': 'ボール', 'kite': '凧', 'baseball bat': 'バット',
+    'baseball glove': 'グローブ', 'skateboard': 'スケボー', 'surfboard': 'サーフボード',
+    'tennis racket': 'ラケット', 'bottle': 'ボトル', 'wine glass': 'グラス', 'cup': 'コップ',
+    'fork': 'フォーク', 'knife': 'ナイフ', 'spoon': 'スプーン', 'bowl': '器',
+    'banana': 'バナナ', 'apple': 'リンゴ', 'sandwich': 'サンドイッチ', 'orange': 'オレンジ',
+    'broccoli': '野菜', 'carrot': 'ニンジン', 'hot dog': 'ホットドッグ', 'pizza': 'ピザ',
+    'donut': 'ドーナツ', 'cake': 'ケーキ', 'chair': '椅子', 'couch': 'ソファ',
+    'potted plant': '観葉植物', 'bed': 'ベッド', 'dining table': 'テーブル', 'toilet': 'トイレ',
+    'tv': 'テレビ', 'laptop': 'パソコン', 'mouse': 'マウス', 'remote': 'リモコン',
+    'keyboard': 'キーボード', 'cell phone': 'スマホ', 'microwave': '電子レンジ',
+    'oven': 'オーブン', 'toaster': 'トースター', 'sink': 'シンク', 'refrigerator': '冷蔵庫',
+    'book': '本', 'clock': '時計', 'vase': '花瓶', 'scissors': 'ハサミ',
+    'teddy bear': 'ぬいぐるみ', 'hair drier': 'ドライヤー', 'toothbrush': '歯ブラシ'
+}
+
+def sanitize_filename_part(text):
+    if not text:
+        return "写真"
+    cleaned = re.sub(r'[\\/*?:"<>|\[\]\(\)\s　、。,\.\-\_]+', '', text)
+    cleaned = cleaned[:12]
+    return cleaned if cleaned else "写真"
+
+def check_ollama_status(ollama_url="http://localhost:11434"):
+    """Ollama サーバーの導通状態を確認"""
+    try:
+        target_url = ollama_url.replace("0.0.0.0", "127.0.0.1").rstrip('/')
+        resp = requests.get(f"{target_url}/api/tags", timeout=5)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+def recognize_content_vlm(file_path, model="llama3.2-vision", ollama_url="http://localhost:11434"):
+    """Ollama Vision API (llama3.2-vision / llava など) で日本語表現を取得"""
+    try:
+        target_url = ollama_url.replace("0.0.0.0", "127.0.0.1").rstrip('/')
+        with Image.open(file_path) as im:
+            im_rgb = im.convert("RGB")
+            im_rgb.thumbnail((1024, 1024))
+            buf = io.BytesIO()
+            im_rgb.save(buf, format="JPEG", quality=85)
+            img_bytes = buf.getvalue()
+            b64_image = base64.b64encode(img_bytes).decode("utf-8")
+
+        prompt = (
+            "この写真の主要な被写体または情景を、ファイル名に使用できる簡潔な日本語の名詞"
+            "（1〜2単語程度、記号なし、2〜8文字、例: ガジュマル, ジンベエザメ, ハイビスカス, 初日の出, ダイビング, BBQ, 集合写真, 料理 など）"
+            "で1つだけ出力してください。説明文や英語は不要です。"
+        )
+
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "images": [b64_image],
+            "stream": False,
+            "options": {
+                "temperature": 0.1,
+                "num_predict": 30
+            }
+        }
+
+        resp = requests.post(f"{target_url}/api/generate", json=payload, timeout=60)
+        if resp.status_code == 200:
+            res_data = resp.json()
+            raw_text = res_data.get("response", "").strip()
+            raw_text = raw_text.split('\n')[0].split('。')[0]
+            return sanitize_filename_part(raw_text)
+        else:
+            print(f"Ollama API エラー (HTTP {resp.status_code}): {resp.text}", flush=True)
+            return recognize_content_yolo(file_path)
+
+    except Exception as e:
+        print(f"VLM 推論エラー ({os.path.basename(file_path)}): {e}", flush=True)
+        return recognize_content_yolo(file_path)
+
+def load_yolo_model():
+    global yolo_model
+    if yolo_model is not None:
+        return yolo_model
+
+    from ultralytics import YOLO
+    model_dir = os.path.join(os.path.expanduser("~"), ".openvino_photo_rename_model")
+    os.makedirs(model_dir, exist_ok=True)
+    ov_export_path = os.path.join(model_dir, "yolo11n_openvino_model")
+
+    if not os.path.exists(ov_export_path):
+        pt_model = YOLO("yolo11n.pt")
+        ov_export_path = pt_model.export(format="openvino")
+
+    yolo_model = YOLO(ov_export_path, task="detect")
+    return yolo_model
+
+def recognize_content_yolo(file_path):
+    model = load_yolo_model()
+    try:
+        results = model(file_path, verbose=False, conf=0.35)
+        if not results or len(results) == 0:
+            return "写真"
+        boxes = results[0].boxes
+        if len(boxes) == 0:
+            return "写真"
+
+        detected_names = []
+        person_count = 0
+        food_count = 0
+
+        for box in boxes:
+            cls_id = int(box.cls[0])
+            name = model.names[cls_id]
+            detected_names.append(name)
+            if name == 'person':
+                person_count += 1
+            elif name in ['sandwich', 'cake', 'pizza', 'donut', 'hot dog', 'bowl']:
+                food_count += 1
+
+        if person_count >= 3:
+            return "集合写真"
+        elif food_count >= 1:
+            return "料理"
+
+        counts = Counter(detected_names)
+        most_common_eng, _ = counts.most_common(1)[0]
+        ja_name = COCO_JA_MAP.get(most_common_eng, "写真")
+        return sanitize_filename_part(ja_name)
+    except Exception:
+        return "写真"
+
+def get_location_name(lat, lon):
+    if lat is None or lon is None:
+        return ""
+    cache_key = (round(lat, 3), round(lon, 3))
+    if cache_key in geo_cache:
+        return geo_cache[cache_key]
+    
+    try:
+        time.sleep(0.3)
+        location = geolocator.reverse((lat, lon), language='ja', timeout=5)
+        if location and 'address' in location.raw:
+            addr = location.raw['address']
+            province = addr.get('province', addr.get('state', ''))
+            city = addr.get('city', addr.get('town', addr.get('village', addr.get('suburb', ''))))
+            loc_str = f"{province}{city}".strip()
+            if loc_str:
+                geo_cache[cache_key] = loc_str
+                return loc_str
+    except Exception:
+        pass
+    
+    try:
+        res = rg.search([(lat, lon)])[0]
+        pref = res.get('admin1', '')
+        name = res.get('name', '')
+        loc_str = f"{pref}{name}".strip()
+        geo_cache[cache_key] = loc_str
+        return loc_str
+    except Exception:
+        return ""
+
+def convert_dms_to_deg(dms, ref):
+    if not dms or len(dms) < 3:
+        return None
+    try:
+        d = float(dms[0])
+        m = float(dms[1])
+        s = float(dms[2])
+        deg = d + (m / 60.0) + (s / 3600.0)
+        if ref in ['S', 'W']:
+            deg = -deg
+        return deg
+    except Exception:
+        return None
+
+def extract_exif_info(file_path):
+    date_str = None
+    time_sort = 0
+    lat = None
+    lon = None
+    
+    try:
+        with Image.open(file_path) as img:
+            exif = img.getexif()
+            if exif:
+                dt_raw = None
+                try:
+                    exif_ifd = exif.get_ifd(IFD.Exif)
+                    dt_raw = exif_ifd.get(36867) or exif_ifd.get(36868)
+                except Exception:
+                    pass
+                if not dt_raw:
+                    dt_raw = exif.get(306)
+                
+                if dt_raw and isinstance(dt_raw, str):
+                    m = re.search(r'(\d{4})[:\-](\d{2})[:\-](\d{2})\s+(\d{2})[:\-](\d{2})[:\-](\d{2})', dt_raw)
+                    if m:
+                        date_str = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+                        time_sort = int(f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(4)}{m.group(5)}{m.group(6)}")
+                    else:
+                        m2 = re.search(r'(\d{4})[:\-](\d{2})[:\-](\d{2})', dt_raw)
+                        if m2:
+                            date_str = f"{m2.group(1)}{m2.group(2)}{m2.group(3)}"
+                
+                try:
+                    gps_ifd = exif.get_ifd(IFD.GPSInfo)
+                    if gps_ifd:
+                        lat_val = gps_ifd.get(2)
+                        lat_ref = gps_ifd.get(1, 'N')
+                        lon_val = gps_ifd.get(4)
+                        lon_ref = gps_ifd.get(3, 'E')
+                        if lat_val and lon_val:
+                            lat = convert_dms_to_deg(lat_val, lat_ref)
+                            lon = convert_dms_to_deg(lon_val, lon_ref)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    
+    if not date_str:
+        parent = os.path.basename(os.path.dirname(file_path))
+        m_parent = re.search(r'(\d{8})', parent)
+        if m_parent:
+            date_str = m_parent.group(1)
+        else:
+            fname = os.path.basename(file_path)
+            m_fname = re.search(r'(20\d{6})', fname)
+            if m_fname:
+                date_str = m_fname.group(1)
+            else:
+                m_fname2 = re.search(r'(\d{2})(\d{2})(\d{2})', fname)
+                if m_fname2 and 0 <= int(m_fname2.group(1)) <= 30:
+                    date_str = f"20{m_fname2.group(1)}{m_fname2.group(2)}{m_fname2.group(3)}"
+        
+        if not date_str:
+            try:
+                mtime = os.path.getmtime(file_path)
+                dt = datetime.fromtimestamp(mtime)
+                date_str = dt.strftime("%Y%m%d")
+                time_sort = int(dt.strftime("%Y%m%d%H%M%S"))
+            except Exception:
+                date_str = "20090101"
+                
+    if time_sort == 0:
+        try:
+            mtime = os.path.getmtime(file_path)
+            time_sort = int(datetime.fromtimestamp(mtime).strftime("%Y%m%d%H%M%S"))
+        except Exception:
+            time_sort = 0
+            
+    return date_str, time_sort, lat, lon
+
+def scan_files(root_dir):
+    image_files = []
+    for root, dirs, files in os.walk(root_dir):
+        for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext in VALID_EXTENSIONS:
+                if f.startswith("batch_rename") or f.startswith("rollback"):
+                    continue
+                image_files.append(os.path.join(root, f))
+    return image_files
+
+def select_year_interactively():
+    if not os.path.exists(BASE_PHOTO_DIR):
+        print(f"[ERROR] 写真ルートフォルダーが見つかりません: {BASE_PHOTO_DIR}")
+        sys.exit(1)
+
+    entries = os.listdir(BASE_PHOTO_DIR)
+    year_dirs = [e for e in entries if os.path.isdir(os.path.join(BASE_PHOTO_DIR, e)) and re.match(r'^\d{4}$', e)]
+    year_dirs.sort()
+
+    if not year_dirs:
+        print(f"[ERROR] 年別フォルダーが見つかりませんでした: {BASE_PHOTO_DIR}")
+        sys.exit(1)
+
+    print("\n=== 対象の年別フォルダーを選択してください ===")
+    for idx, y in enumerate(year_dirs, start=1):
+        full_p = os.path.join(BASE_PHOTO_DIR, y)
+        file_cnt = len(scan_files(full_p))
+        print(f" [{idx}] {y}年 ({file_cnt} 枚の画像)")
+
+    print(" ===========================================")
+    while True:
+        try:
+            choice = input(f"番号を入力してください (1-{len(year_dirs)}): ").strip()
+            if choice.isdigit():
+                num = int(choice)
+                if 1 <= num <= len(year_dirs):
+                    selected_year = year_dirs[num - 1]
+                    return os.path.join(BASE_PHOTO_DIR, selected_year)
+        except (KeyboardInterrupt, EOFError):
+            print("\n処理をキャンセルしました。")
+            sys.exit(0)
+        print("有効な番号を入力してください。")
+
+def main():
+    default_ollama_host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+    if "0.0.0.0" in default_ollama_host:
+        default_ollama_host = default_ollama_host.replace("0.0.0.0", "127.0.0.1")
+    if not default_ollama_host.startswith("http://") and not default_ollama_host.startswith("https://"):
+        default_ollama_host = f"http://{default_ollama_host}"
+    if ":11434" not in default_ollama_host and not default_ollama_host.endswith(":11434"):
+        default_ollama_host = f"{default_ollama_host}:11434"
+
+    parser = argparse.ArgumentParser(description="Rename photos with EXIF date, location, and Ollama Vision AI Model.")
+    parser.add_argument("--year", help="Target year (e.g. 2009, 2025)")
+    parser.add_argument("--root", help="Root directory (Overrides --year)")
+    parser.add_argument("--execute", action="store_true", help="Perform actual rename")
+    parser.add_argument("--limit", type=int, default=0, help="Limit number of files for testing")
+    parser.add_argument("--model", default="llava", help="AI Model to use: llava, llama3.2-vision, qwen2.5-vl, yolo (default: llava)")
+    parser.add_argument("--ollama-url", default=default_ollama_host, help=f"Ollama Server URL (default: {default_ollama_host})")
+    args = parser.parse_args()
+
+    if args.root:
+        target_root = args.root
+    elif args.year:
+        target_root = os.path.join(BASE_PHOTO_DIR, str(args.year))
+    else:
+        target_root = select_year_interactively()
+
+    if not os.path.exists(target_root):
+        print(f"[ERROR] ディレクトリが存在しません: {target_root}")
+        sys.exit(1)
+
+    history_file = os.path.join(target_root, "rename_history.json")
+    csv_file = os.path.join(target_root, "rename_preview.csv")
+    cache_file = os.path.join(target_root, "photo_cache.json")
+
+    is_ollama_active = False
+    if args.model.lower() != "yolo":
+        target_check_url = args.ollama_url.replace("0.0.0.0", "127.0.0.1")
+        is_ollama_active = check_ollama_status(target_check_url)
+        if not is_ollama_active:
+            print(f"[WARNING] Ollama サーバー ({args.ollama_url}) に接続できませんでした。")
+            print("          Ollama が未起動の場合は YOLO モデルへフォールバックします。")
+
+    model_label = f"Ollama ({args.model})" if args.model.lower() != "yolo" else "YOLOv11"
+
+    print(f"\n==========================================")
+    print(f"=== Photo Batch Renaming Tool (Ollama) ===")
+    print(f"使用AIモデル     : {model_label}")
+    print(f"Ollama サーバー  : {args.ollama_url}")
+    print(f"対象ディレクトリ : {target_root}")
+    print(f"動作モード       : {'【実行 (ファイル変更あり)】' if args.execute else '【プレビューのみ (DRY-RUN)】'}")
+    if args.limit > 0:
+        print(f"処理件数制限     : 上限 {args.limit} 件")
+    print(f"==========================================\n")
+
+    cache = {}
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            print(f"キャッシュデータ: {len(cache)} 件のメタデータをロードしました。")
+        except Exception:
+            pass
+
+    files = scan_files(target_root)
+    print(f"対象画像ファイル数: 全 {len(files)} 件")
+    if len(files) == 0:
+        print("対象となる画像ファイルが見つかりませんでした。終了します。")
+        return
+
+    if args.limit > 0:
+        files = files[:args.limit]
+
+    dir_files = defaultdict(list)
+    for f in files:
+        dir_files[os.path.dirname(f)].append(f)
+
+    all_rename_plans = []
+    total_count = len(files)
+    processed_count = 0
+
+    for d, flist in dir_files.items():
+        dir_records = []
+        gps_locations_in_dir = []
+        
+        # 1st Pass: EXIF / GPS
+        for fpath in flist:
+            rel = os.path.relpath(fpath, target_root)
+            date_str, time_sort, lat, lon = extract_exif_info(fpath)
+            loc_str = ""
+            if lat is not None and lon is not None:
+                loc_str = get_location_name(lat, lon)
+                if loc_str:
+                    gps_locations_in_dir.append(loc_str)
+            dir_records.append({
+                "path": fpath,
+                "rel": rel,
+                "date": date_str,
+                "time_sort": time_sort,
+                "lat": lat,
+                "lon": lon,
+                "location": loc_str,
+                "ext": os.path.splitext(fpath)[1]
+            })
+
+        default_loc = ""
+        if gps_locations_in_dir:
+            default_loc = Counter(gps_locations_in_dir).most_common(1)[0][0]
+
+        # 2nd Pass: AI 画像認識
+        for item in dir_records:
+            processed_count += 1
+            fpath = item["path"]
+            
+            if not item["location"]:
+                item["location"] = default_loc
+
+            cached_entry = cache.get(fpath)
+            if cached_entry and "content" in cached_entry and cached_entry["content"]:
+                content = cached_entry["content"]
+            else:
+                print(f"[{processed_count}/{total_count}] [{model_label}] AI解析中: {os.path.basename(fpath)} ...", flush=True)
+                if args.model.lower() != "yolo" and is_ollama_active:
+                    content = recognize_content_vlm(fpath, model=args.model, ollama_url=args.ollama_url)
+                else:
+                    content = recognize_content_yolo(fpath)
+
+                print(f"    => 判定結果: 【{content}】", flush=True)
+                cache[fpath] = {
+                    "date": item["date"],
+                    "location": item["location"],
+                    "content": content
+                }
+                with open(cache_file, "w", encoding="utf-8") as cf:
+                    json.dump(cache, cf, ensure_ascii=False, indent=2)
+
+            item["content"] = content
+
+        with open(cache_file, "w", encoding="utf-8") as cf:
+            json.dump(cache, cf, ensure_ascii=False, indent=2)
+
+        dir_records.sort(key=lambda x: (x["time_sort"], x["path"]))
+
+        prefix_groups = defaultdict(list)
+        for item in dir_records:
+            loc_part = f"_{item['location']}" if item['location'] else ""
+            prefix = f"{item['date']}{loc_part}_{item['content']}"
+            prefix_groups[prefix].append(item)
+
+        for prefix, items in prefix_groups.items():
+            for idx, item in enumerate(items, start=1):
+                new_filename = f"{prefix}_{idx:02d}{item['ext']}"
+                new_path = os.path.join(d, new_filename)
+                all_rename_plans.append({
+                    "original_path": item["path"],
+                    "new_path": new_path,
+                    "original_name": os.path.basename(item["path"]),
+                    "new_name": new_filename,
+                    "dir": d
+                })
+
+    import csv
+    with open(csv_file, "w", encoding="utf-8-sig", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Directory", "Original Name", "New Name", "Original Path", "New Path"])
+        for p in all_rename_plans:
+            writer.writerow([p["dir"], p["original_name"], p["new_name"], p["original_path"], p["new_path"]])
+
+    print(f"\nプレビュー結果を CSV に保存しました: {csv_file}")
+
+    rollback_script_path = os.path.join(target_root, "rollback_rename.py")
+    with open(rollback_script_path, "w", encoding="utf-8") as rf:
+        rf.write(f'''# 年別自動生成ロールバックスクリプト
+import json
+import os
+
+HISTORY_FILE = r"{history_file}"
+
+def rollback():
+    if not os.path.exists(HISTORY_FILE):
+        print(f"履歴ファイルが見つかりません: {{HISTORY_FILE}}")
+        return
+    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+        history = json.load(f)
+    print(f"{{len(history)}} 件のファイルを元の名前へ復元中...")
+    count = 0
+    for item in history:
+        new_path = item["new_path"]
+        orig_path = item["original_path"]
+        if os.path.exists(new_path):
+            try:
+                os.rename(new_path, orig_path)
+                count += 1
+            except Exception as e:
+                print(f"復元エラー {{new_path}} -> {{orig_path}}: {{e}}")
+    print(f"正常に {{count}} 件のファイルを元に戻しました。")
+
+if __name__ == '__main__':
+    rollback()
+''')
+    print(f"ロールバックスクリプトを生成しました: {rollback_script_path}")
+
+    print("\n--- 変換プレビューサンプル（先頭 15 件） ---")
+    for p in all_rename_plans[:15]:
+        print(f"  {p['original_name']}  ==>  {p['new_name']}")
+    if len(all_rename_plans) > 15:
+        print(f"  ...他 {len(all_rename_plans) - 15} 件")
+
+    if args.execute:
+        print("\n>>> リネーム処理を開始します <<<")
+        success_history = []
+        renamed_count = 0
+        for p in all_rename_plans:
+            orig = p["original_path"]
+            new_p = p["new_path"]
+            if orig == new_p:
+                continue
+            if os.path.exists(new_p) and new_p.lower() != orig.lower():
+                print(f"警告: 変更先のファイル名が既に存在するためスキップします: {new_p}")
+                continue
+            try:
+                os.rename(orig, new_p)
+                success_history.append(p)
+                renamed_count += 1
+            except Exception as e:
+                print(f"リネーム失敗 {orig} -> {new_p}: {e}")
+
+        with open(history_file, "w", encoding="utf-8") as hf:
+            json.dump(success_history, hf, ensure_ascii=False, indent=2)
+        print(f"\n==========================================")
+        print(f"完了! {renamed_count} 件のファイル名を変更しました。")
+        print(f"リネーム履歴: {history_file}")
+        print(f"==========================================")
+    else:
+        print("\n※ 現在は DRY-RUN (プレビュー) モードです。ファイル名は変更されていません。")
+        print(f"実際に変更を実行するには --execute オプションを付けて実行してください:")
+        print(f"  python batch_rename_photos.py --year {os.path.basename(target_root)} --execute\n")
+
+if __name__ == '__main__':
+    main()
