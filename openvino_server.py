@@ -5,6 +5,7 @@ import base64
 import io
 import time
 import argparse
+import traceback
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import Counter
 from PIL import Image
@@ -46,10 +47,11 @@ class OpenVINOYOLOEngine:
         available = core.available_devices
         print(f"[OpenVINO] 検出されたデバイス: {available}", flush=True)
 
-        if device == "GPU" and not any("GPU" in d for d in available):
+        if device.upper() == "GPU" and not any("GPU" in d for d in available):
             print("[OpenVINO] GPUが検出されなかったため、CPUを使用します。", flush=True)
             self.device = "CPU"
         else:
+            self.device = device.upper()
             print(f"[OpenVINO] 選択されたデバイス: {self.device}", flush=True)
 
         model_dir = os.path.join(os.path.expanduser("~"), ".openvino_photo_rename_model")
@@ -61,15 +63,28 @@ class OpenVINOYOLOEngine:
             pt = YOLO("yolo11n.pt")
             ov_model_path = pt.export(format="openvino", dynamic=False)
 
-        print(f"[OpenVINO] モデル読み込み中: {ov_model_path} ({self.device})", flush=True)
+        print(f"[OpenVINO] モデル読み込み中: {ov_model_path} (intel:{self.device})", flush=True)
         self.model = YOLO(ov_model_path, task="detect")
-        print("[OpenVINO] モデル準備完了！超高速推論（0.01〜0.05秒/枚）が利用可能です。", flush=True)
+        self.intel_device_str = f"intel:{self.device}"
+        
+        # 初回ウォームアップ推論
+        dummy_img = Image.new("RGB", (640, 640), color="white")
+        try:
+            self.model(dummy_img, device=self.intel_device_str, verbose=False)
+        except Exception:
+            self.model(dummy_img, verbose=False)
+
+        print(f"[OpenVINO] モデル準備完了！デバイス '{self.device}' で超高速推論（0.01〜0.05秒/枚）が利用可能です。", flush=True)
 
     def predict_base64(self, b64_str):
         img_bytes = base64.b64decode(b64_str)
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
-        results = self.model(img, verbose=False, conf=0.35, device=self.device)
+        try:
+            results = self.model(img, device=self.intel_device_str, verbose=False, conf=0.35)
+        except Exception:
+            results = self.model(img, verbose=False, conf=0.35)
+
         if not results or len(results) == 0:
             return "写真"
         boxes = results[0].boxes
@@ -148,22 +163,30 @@ class OpenVINORequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"error": "No image provided"}')
             return
 
-        t0 = time.time()
-        label = ov_engine.predict_base64(b64)
-        elapsed = round((time.time() - t0) * 1000, 1)
+        try:
+            t0 = time.time()
+            label = ov_engine.predict_base64(b64)
+            elapsed = round((time.time() - t0) * 1000, 1)
 
-        print(f"[{self.client_address[0]}] 判定: 【{label}】 ({elapsed} ms)", flush=True)
+            print(f"[{self.client_address[0]}] 判定: 【{label}】 ({elapsed} ms)", flush=True)
 
-        resp_data = {
-            "response": label,
-            "choices": [{"message": {"content": label}}],
-            "model": "openvino-yolo11"
-        }
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json; charset=utf-8')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-        self.wfile.write(json.dumps(resp_data, ensure_ascii=False).encode('utf-8'))
+            resp_data = {
+                "response": label,
+                "choices": [{"message": {"content": label}}],
+                "model": "openvino-yolo11"
+            }
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp_data, ensure_ascii=False).encode('utf-8'))
+        except Exception as e:
+            traceback.print_exc()
+            self.send_response(500)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            err_data = {"error": str(e), "response": "写真"}
+            self.wfile.write(json.dumps(err_data).encode('utf-8'))
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -173,7 +196,7 @@ class OpenVINORequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, format, *args):
-        pass # 静かなログ
+        pass
 
 def main():
     parser = argparse.ArgumentParser(description="OpenVINO Dedicated LAN AI Server")
