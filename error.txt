@@ -1,0 +1,38 @@
+PS C:\Users\yamac\batch_rename_photos> .\start_openvino_fast_yolo.bat
+========================================================
+ OpenVINO YOLOv11 Ultra-Fast Detection Server (40ms)
+ Hardware: Intel Core Ultra 7 258V (Intel Arc 140V GPU)
+========================================================
+OpenVINO YOLO 超高速サーバーを起動中 (ポート 8000)...
+[OpenVINO YOLO] 検出されたデバイス: ['CPU', 'GPU', 'NPU']
+[OpenVINO YOLO] 選択されたデバイス: GPU
+[OpenVINO YOLO] YOLOv11n を OpenVINO IR 形式に最適化エクスポート中（初回のみ）...
+Ultralytics 8.4.156  Python-3.13.13 torch-2.14.0+cpu CPU (Intel Core Ultra 7 258V)
+YOLO11n summary (fused): 100 layers, 2,616,248 parameters, 0 gradients, 6.5 GFLOPs
+
+PyTorch: starting from 'yolo11n.pt' with input shape (1, 3, 640, 640) BCHW and output shape(s) (1, 84, 8400) (5.4 MB)
+
+OpenVINO: starting export with openvino 2026.4.0-22959-99c81491cc3-releases/2026/4...
+C:\Users\yamac\miniconda3\Lib\site-packages\torch\jit\_trace.py:1006: FutureWarning: `torch.jit.trace` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+C:\Users\yamac\miniconda3\Lib\site-packages\torch\jit\_trace.py:1145: FutureWarning: `torch.jit.trace_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+OpenVINO: export success  0.9s, saved as 'yolo11n_openvino_model\' (10.4 MB)
+
+Export complete (1.1s)
+Results saved to C:\Users\yamac\batch_rename_photos\yolo11n_openvino_model
+Predict:         yolo predict task=detect model=yolo11n_openvino_model\ imgsz=640
+Validate:        yolo val task=detect model=yolo11n_openvino_model\ imgsz=640 data=/usr/src/ultralytics/ultralytics/cfg/datasets/coco.yaml
+Visualize:       https://netron.app
+[OpenVINO YOLO] モデル読み込み中: yolo11n_openvino_model\ (intel:GPU)
+Loading yolo11n_openvino_model\ for OpenVINO inference...
+Using OpenVINO LATENCY mode for batch=1 inference on GPU.0...
+[OpenVINO YOLO] モデル準備完了！デバイス 'GPU' で超高速推論（0.01〜0.05秒/枚）が利用可能です。
+
+=======================================================
+=== OpenVINO Dedicated LAN AI Server ===
+待機アドレス : http://0.0.0.0:8000
+エンジン種別 : YOLO (YOLOv11n (40ms 高速モード))
+稼働デバイス : GPU (Intel Arc GPU / NPU / CPU)
+※ このウィンドウを開いたままにしておいてください
+=======================================================
