@@ -15,6 +15,7 @@ from PIL import Image
 sys.stdout.reconfigure(encoding='utf-8')
 
 ov_engine = None
+vlm_error_msg = ""
 
 COCO_JA_MAP = {
     'person': '人物', 'bicycle': '自転車', 'car': '自動車', 'motorcycle': 'バイク',
@@ -221,6 +222,7 @@ class OpenVINORequestHandler(BaseHTTPRequestHandler):
                 "engine": "OpenVINO",
                 "device": ov_engine.device if ov_engine else "unknown",
                 "model_name": ov_engine.model_name if hasattr(ov_engine, "model_name") else "unknown",
+                "vlm_error": vlm_error_msg,
                 "models": [{"name": getattr(ov_engine, "model_name", "openvino-model"), "model": getattr(ov_engine, "model_name", "openvino-model")}]
             }
             self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
@@ -305,12 +307,14 @@ def main():
     parser.add_argument("--device", default="GPU", help="OpenVINO Device: GPU, NPU, CPU (default: GPU)")
     args = parser.parse_args()
 
-    global ov_engine
+    global ov_engine, vlm_error_msg
     if args.engine == "vlm":
         try:
             ov_engine = OpenVINOVLMEngine(model_id=args.vlm_model, device=args.device)
         except Exception as e:
+            vlm_error_msg = f"{e}\n{traceback.format_exc()}"
             print(f"\n[WARNING] VLM エンジンの初期化に失敗しました: {e}")
+            traceback.print_exc()
             print("          超高速 YOLO エンジンに自動フォールバックします...\n", flush=True)
             ov_engine = OpenVINOYOLOEngine(device=args.device)
     else:
