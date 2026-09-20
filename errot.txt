@@ -1,7 +1,0 @@
-PS C:\Users\yamac\batch_rename_photos> .\start_openvino_server.ps1
-発生場所 C:\Users\yamac\batch_rename_photos\start_openvino_server.ps1:15 文字:12
-+ Write-Host "窶ｻ 蛻晏屓襍ｷ蜍墓凾縺ｯ繝｢繝・Ν (邏・4.8 GB) 縺ｮ繝繧ｦ繝ｳ繝ｭ繝ｼ繝峨→ GPU 繧ｳ繝ｳ繝代う ...
-+            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-文字列に終端記号 " がありません。
-    + CategoryInfo          : ParserError: (:) [], ParseException
-    + FullyQualifiedErrorId : TerminatorExpectedAtEndOfString
